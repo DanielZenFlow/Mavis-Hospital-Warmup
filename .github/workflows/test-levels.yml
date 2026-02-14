@@ -1,4 +1,4 @@
-name: Test All Levels
+name: Benchmark All Strategies
 
 on:
   push:
@@ -7,17 +7,6 @@ on:
     branches: [main, master]
   workflow_dispatch:
     inputs:
-      strategy:
-        description: "Search strategy to use"
-        required: false
-        default: "bfs"
-        type: choice
-        options:
-          - bfs
-          - dfs
-          - astar
-          - wastar
-          - greedy
       timeout:
         description: "Timeout per level (seconds)"
         required: false
@@ -25,7 +14,6 @@ on:
         type: string
 
 env:
-  STRATEGY: ${{ github.event.inputs.strategy || 'bfs' }}
   LEVEL_TIMEOUT: ${{ github.event.inputs.timeout || '180' }}
   JAVA_XMX: "4g"
 
@@ -51,13 +39,14 @@ jobs:
           name: compiled-classes
           path: searchclient/*.class
 
-  test-levels:
-    name: Test Levels
+  benchmark:
+    name: Benchmark ${{ matrix.strategy }} - ${{ matrix.batch }}
     needs: build
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        strategy: [bfs, dfs, astar]
         batch: [SA, MA, MAPF]
     steps:
       - uses: actions/checkout@v4
@@ -79,26 +68,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run ${{ matrix.batch }} levels via benchmark script
-        id: test
+      - name: Run ${{ matrix.strategy }} on ${{ matrix.batch }} levels
+        id: benchmark
         continue-on-error: true
         run: |
-          python run_benchmark.py \
-            -s "$STRATEGY" \
+          python ci_benchmark.py \
+            -s "${{ matrix.strategy }}" \
             -t "$LEVEL_TIMEOUT" \
             -f "${{ matrix.batch }}" \
-            -o "results-${{ matrix.batch }}.md"
+            -o "results-${{ matrix.strategy }}-${{ matrix.batch }}.md"
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-${{ matrix.batch }}
-          path: results-${{ matrix.batch }}.md
+          name: results-${{ matrix.strategy }}-${{ matrix.batch }}
+          path: results-${{ matrix.strategy }}-${{ matrix.batch }}.md
 
-  summary:
-    name: Test Summary
-    needs: test-levels
+  report:
+    name: Benchmark Report
+    needs: benchmark
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -110,9 +99,9 @@ jobs:
 
       - name: Generate summary
         run: |
-          echo "# 🏥 MAvis Hospital Level Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "# 🏥 MAvis Hospital Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Strategy**: \`${STRATEGY}\` | **Timeout**: ${LEVEL_TIMEOUT}s per level" >> $GITHUB_STEP_SUMMARY
+          echo "**Strategies**: bfs, dfs, astar | **Timeout**: ${LEVEL_TIMEOUT}s per level" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           for f in results-*.md; do
