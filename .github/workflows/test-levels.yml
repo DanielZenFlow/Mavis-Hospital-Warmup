@@ -1,0 +1,203 @@
+name: Test All Levels
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "Search strategy to use"
+        required: false
+        default: "bfs"
+        type: choice
+        options:
+          - bfs
+          - dfs
+          - astar
+          - greedy
+      timeout:
+        description: "Timeout per level (seconds)"
+        required: false
+        default: "180"
+        type: string
+
+env:
+  STRATEGY: ${{ github.event.inputs.strategy || 'bfs' }}
+  LEVEL_TIMEOUT: ${{ github.event.inputs.timeout || '180' }}
+  JAVA_XMX: "4g"
+
+jobs:
+  build:
+    name: Compile Search Client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Compile search client
+        run: javac searchclient/*.java
+
+      - name: Upload compiled classes
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-classes
+          path: searchclient/*.class
+
+  test-levels:
+    name: Test Levels
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: [SA, MA, MAPF]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download compiled classes
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-classes
+          path: searchclient/
+
+      - name: Run ${{ matrix.batch }} levels
+        id: test
+        run: |
+          RESULTS_FILE="results-${{ matrix.batch }}.md"
+          echo "## ${{ matrix.batch }} Levels — Strategy: \`${STRATEGY}\` | Timeout: ${LEVEL_TIMEOUT}s" > "$RESULTS_FILE"
+          echo "" >> "$RESULTS_FILE"
+          echo "| Level | Status | Solution Length | Time (s) | Memory |" >> "$RESULTS_FILE"
+          echo "|-------|--------|-----------------|----------|--------|" >> "$RESULTS_FILE"
+
+          TOTAL=0
+          PASSED=0
+          FAILED=0
+          TIMEOUT_COUNT=0
+          ERROR_COUNT=0
+
+          for level_file in levels/${{ matrix.batch }}*.lvl; do
+            [ -f "$level_file" ] || continue
+            level_name=$(basename "$level_file" .lvl)
+            TOTAL=$((TOTAL + 1))
+
+            echo "=========================================="
+            echo "Testing: $level_name"
+            echo "=========================================="
+
+            # Run the server with the search client
+            OUTPUT_FILE=$(mktemp)
+            START_TIME=$(date +%s%N)
+
+            set +e
+            timeout "${LEVEL_TIMEOUT}s" java -jar server.jar \
+              -l "$level_file" \
+              -c "java -Xmx${JAVA_XMX} searchclient.SearchClient -${STRATEGY}" \
+              -t "$LEVEL_TIMEOUT" \
+              > "$OUTPUT_FILE" 2>&1
+            EXIT_CODE=$?
+            set -e
+
+            END_TIME=$(date +%s%N)
+            ELAPSED=$(( (END_TIME - START_TIME) / 1000000000 ))
+
+            # Parse results
+            SOL_LENGTH="-"
+            MEMORY_INFO="-"
+
+            if grep -q "Found solution of length" "$OUTPUT_FILE"; then
+              SOL_LENGTH=$(grep "Found solution of length" "$OUTPUT_FILE" | grep -oP '\d+' | tail -1)
+            fi
+
+            if grep -q "Memory used:" "$OUTPUT_FILE"; then
+              MEMORY_INFO=$(grep "Memory used:" "$OUTPUT_FILE" | tail -1 | sed 's/.*Memory used: //')
+            fi
+
+            if [ $EXIT_CODE -eq 124 ]; then
+              STATUS="⏱️ Timeout"
+              TIMEOUT_COUNT=$((TIMEOUT_COUNT + 1))
+              echo "  → TIMEOUT after ${LEVEL_TIMEOUT}s"
+            elif [ $EXIT_CODE -ne 0 ]; then
+              STATUS="❌ Error ($EXIT_CODE)"
+              ERROR_COUNT=$((ERROR_COUNT + 1))
+              echo "  → ERROR (exit code: $EXIT_CODE)"
+              # Print last 20 lines of output for debugging
+              echo "  --- Last 20 lines of output ---"
+              tail -20 "$OUTPUT_FILE" | sed 's/^/  /'
+            elif [ "$SOL_LENGTH" != "-" ]; then
+              STATUS="✅ Solved"
+              PASSED=$((PASSED + 1))
+              echo "  → SOLVED (length: $SOL_LENGTH, time: ${ELAPSED}s)"
+            else
+              STATUS="❓ Unknown"
+              FAILED=$((FAILED + 1))
+              echo "  → Finished but no solution found"
+              tail -10 "$OUTPUT_FILE" | sed 's/^/  /'
+            fi
+
+            echo "| \`$level_name\` | $STATUS | $SOL_LENGTH | ${ELAPSED} | $MEMORY_INFO |" >> "$RESULTS_FILE"
+
+            rm -f "$OUTPUT_FILE"
+          done
+
+          echo "" >> "$RESULTS_FILE"
+          echo "### Summary" >> "$RESULTS_FILE"
+          echo "- **Total**: $TOTAL" >> "$RESULTS_FILE"
+          echo "- **Solved**: $PASSED ✅" >> "$RESULTS_FILE"
+          echo "- **Timeout**: $TIMEOUT_COUNT ⏱️" >> "$RESULTS_FILE"
+          echo "- **Error**: $ERROR_COUNT ❌" >> "$RESULTS_FILE"
+          echo "- **Other**: $FAILED ❓" >> "$RESULTS_FILE"
+
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "timeout=$TIMEOUT_COUNT" >> $GITHUB_OUTPUT
+          echo "errors=$ERROR_COUNT" >> $GITHUB_OUTPUT
+
+          cat "$RESULTS_FILE"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.batch }}
+          path: results-${{ matrix.batch }}.md
+
+  summary:
+    name: Test Summary
+    needs: test-levels
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          merge-multiple: true
+
+      - name: Generate summary
+        run: |
+          echo "# 🏥 MAvis Hospital Level Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Strategy**: \`${STRATEGY}\` | **Timeout**: ${LEVEL_TIMEOUT}s per level" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for f in results-*.md; do
+            [ -f "$f" ] || continue
+            cat "$f" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "---" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
